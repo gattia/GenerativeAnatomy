@@ -100,12 +100,6 @@ def setup_optimizer(config, model):
     
     return optimizer_
 
-def norm(x, highdim=False):
-    """
-    Computes norm of an array of vectors. Given (shape,d), returns (shape) after norm along last dimension
-    """
-    return torch.norm(x, dim=len(x.shape) - 1)
-
 def random_scale(pos, min_=0.1, max_=10, center_first=False, log=True):
 
     if min_ > max_:
@@ -154,7 +148,7 @@ def normalize_mesh(pos, method='mean', scale_method='max_rad', ref_scale=None, c
         if ref_scale is not None:
             pos = pos / ref_scale
         elif scale_method == 'max_rad':
-            scale = torch.max(norm(pos), dim=-1, keepdim=True).values.unsqueeze(-1)
+            scale = torch.max(torch.norm(pos, dim=-1), dim=-1, keepdim=True).values.unsqueeze(-1)
             pos = pos / scale
         elif scale_method == 'area': 
             if faces is None:

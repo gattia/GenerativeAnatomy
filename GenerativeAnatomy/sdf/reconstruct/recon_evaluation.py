@@ -44,6 +44,13 @@ def compute_recon_loss(
 
     result = {}
 
+    if not isinstance(meshes, list):
+        meshes = [meshes]
+    if not isinstance(orig_pts, list):
+        orig_pts = [orig_pts]
+
+    assert len(meshes) == len(orig_pts), 'Number of meshes and number of original points must be equal'
+
     for mesh_idx, mesh in enumerate(meshes):
         if mesh is not None:
             pts_recon_ = mesh.point_coords

@@ -49,6 +49,7 @@ class Decoder(nn.Module):
         progressive_add_depth=False,
         progressive_depth_params=PROGRESSIVE_PARAMS,
         latent_noise_sigma=None,
+        layer_split=None,
         **kwargs
     ):
         """
@@ -82,16 +83,18 @@ class Decoder(nn.Module):
         self.progressive_add_depth = progressive_add_depth
         self.progressive_depth_params = progressive_depth_params
         self.latent_noise_sigma = latent_noise_sigma
-
+        self.layer_split = layer_split
+        self.n_objects = n_objects
+        
         #layers:
         # 0: input
         # 1 to N-hidden: NN
         # -1: output
-        if n_objects == 1:
+        if (n_objects == 1) or ((n_objects > 1) and (self.layer_split is not None)):
             self.dims = self.dims + [1]
         else:
-            self.dims = self.dims + [n_objects]        
-
+            self.dims = self.dims + [n_objects]
+        
         self.layers = nn.ModuleList()
         self.bn = nn.ModuleList()
         
@@ -99,15 +102,12 @@ class Decoder(nn.Module):
         for layer in range(len(self.dims)-1):
             # get layer input and output dimensions
             in_dim, out_dim = self.get_layer_dims(layer)
-            lin_layer = nn.Linear(in_dim, out_dim)
-            # initialize the weights - particularly for the sine activation
-            init_weights(module=lin_layer, activation=self._activation_, first_layer=layer==0)
-            # add weight norm if specified
-            # if weight_norm is True and layer in self.norm_layers:
-            if weight_norm is True:
-                lin_layer = nn.utils.weight_norm(lin_layer)
-            elif self.norm_layers is not None and layer in self.norm_layers:
-                self.bn.append(nn.LayerNorm(out_dim))
+            if self.layer_split is not None and layer >= self.layer_split:
+                lin_layer = nn.ModuleList()
+                for _ in range(self.n_objects):
+                    lin_layer.append(self.lin_layer_(in_dim=in_dim, out_dim=out_dim, layer=layer, weight_norm=weight_norm))
+            else:
+                lin_layer = self.lin_layer_(in_dim=in_dim, out_dim=out_dim, layer=layer, weight_norm=weight_norm)
             self.layers.append(lin_layer)
             
         
@@ -117,7 +117,18 @@ class Decoder(nn.Module):
         self.dropout_prob = dropout_prob
         self.dropout = dropout
         self.epoch = None
-
+    
+    def lin_layer_(self, in_dim, out_dim, layer, weight_norm):
+        lin_layer = nn.Linear(in_dim, out_dim)
+        # initialize the weights - particularly for the sine activation
+        init_weights(module=lin_layer, activation=self._activation_, first_layer=layer==0)
+        # add weight norm if specified
+        # if weight_norm is True and layer in self.norm_layers:
+        if weight_norm is True:
+            lin_layer = nn.utils.weight_norm(lin_layer)
+        elif self.norm_layers is not None and layer in self.norm_layers:
+            self.bn.append(nn.LayerNorm(out_dim))
+        return lin_layer
 
     def get_layer_dims(self, layer):
         if self.concat_latent_input == False:
@@ -138,6 +149,33 @@ class Decoder(nn.Module):
 
         return in_dim, out_dim
     
+    def forward_branch_(self, x, input_, layer, layer_idx):
+        if (layer_idx in self.latent_in):
+            xi = torch.cat([x, input_], 1)
+        else:
+            xi = x
+        
+        if ((self.progressive_add_depth is True) and (layer_idx in self.progressive_depth_params['layers'])):
+            if self.epoch >= self.progressive_depth_params['layers'][layer_idx]['start_epoch']:
+                x = self.progressive_layer(xi, layer, layer_idx)     
+            else:
+                return   
+        else:
+            x = layer(xi)
+        
+        # only apply normalization/ regular activation to 
+        # hidden layers (not output)
+        if layer_idx < len(self.layers) - 1:
+
+            if len(self.bn) > 0 and layer_idx in self.norm_layers:
+                x = self.bn[layer_idx](x)
+            x = self.activation(x)
+
+            if self.dropout is not None and layer_idx in self.dropout:  #and (self._activation_ != "sin")
+                x = F.dropout(x, p=self.dropout_prob, training=self.training)
+        
+        return x
+
     # input: N x (L+3)
     def forward(self, input_, epoch=None):
         # Assign the epoch in case needed (for progressive depth)
@@ -148,32 +186,26 @@ class Decoder(nn.Module):
         x = input_            
 
         for layer_idx, layer in enumerate(self.layers): #range(0, self.num_layers - 1):
-            if (layer_idx in self.latent_in):
-                xi = torch.cat([x, input_], 1)
-            # elif layer_idx != 0 and self.xyz_in_all:
-            #     xi = torch.cat([x, xyz], 1)
+            if self.layer_split is not None and layer_idx >= self.layer_split:
+                
+                if layer_idx == self.layer_split:
+                    x = [x,] * self.n_objects
+                    
+                for i in range(self.n_objects):
+                    x_ = self.forward_branch_(x=x[i], input_=input_, layer=layer[i], layer_idx=layer_idx)
+                    if x_ is None:
+                        continue
+                    else:
+                        x[i] = x_
             else:
-                xi = x
+                x = self.forward_branch_(x=x, input_=input_, layer=layer, layer_idx=layer_idx)
+
+            if x is None:
+                continue
             
-            if ((self.progressive_add_depth is True) and (layer_idx in self.progressive_depth_params['layers'])):
-                if self.epoch >= self.progressive_depth_params['layers'][layer_idx]['start_epoch']:
-                    x = self.progressive_layer(xi, layer, layer_idx)     
-                else:
-                    continue        
-            else:
-                x = layer(xi)
+        if self.layer_split is not None:
+            x = torch.cat(x, dim=1)
             
-            # only apply normalization/ regular activation to 
-            # hidden layers (not output)
-            if layer_idx < len(self.layers) - 1:
-
-                if len(self.bn) > 0 and layer_idx in self.norm_layers:
-                    x = self.bn[layer_idx](x)
-                x = self.activation(x)
-
-                if self.dropout is not None and layer_idx in self.dropout:  #and (self._activation_ != "sin")
-                    x = F.dropout(x, p=self.dropout_prob, training=self.training)
-
         if self.final_activation is not None:
             x = self.final_activation(x)
 

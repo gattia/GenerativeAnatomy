@@ -91,9 +91,12 @@ def train_deep_sdf(
                     decoder=model,
                 )
                 if ('val_paths' in config) & (config['val_paths'] is not None):
-
-                    torch.cuda.empty_cache()
                     
+                    torch.cuda.empty_cache()
+
+                    # TODO: Change this to just accept the config? 
+                    # or... update all parameters to be the same in the config and the function call?
+                    # this will just allow unpacking of the config dict.
                     dict_loss = get_mean_errors(
                         mesh_paths=config['val_paths'],
                         decoders=model,
@@ -128,6 +131,8 @@ def train_deep_sdf(
                         scale_all_meshes=True,
                         recon_func=None if (('recon_val_func_name' not in config)) else DICT_VALIDATION_FUNCS[config['recon_val_func_name']],
                         predict_val_variables=None if ('predict_val_variables' not in config) else config['predict_val_variables'],
+
+                        scale_jointly=config['scale_jointly'],
                     )
 
                     log_dict.update(dict_loss)
@@ -185,6 +190,8 @@ def train_epoch(
             sdf_gt_ = sdf_data['gt_sdf'][:, :, surf_idx].reshape(-1, 1)
             if config['enforce_minmax'] is True:
                 sdf_gt_ = torch.clamp(sdf_gt_, -config['clamp_dist'], config['clamp_dist'])
+            elif config['hard_sample_difficulty_weight'] is not None:
+                sdf_gt_ = torch.clamp(sdf_gt_, -1, 1)
             sdf_gt_.requires_grad = False
             sdf_gt.append(sdf_gt_)
         
@@ -232,7 +239,8 @@ def train_epoch(
             pred_sdf = model(inputs, epoch=epoch)
             if config['enforce_minmax'] is True:
                 pred_sdf = torch.clamp(pred_sdf, -config['clamp_dist'], config['clamp_dist'])
-            # pred_sdfs.append(pred_sdf)                       
+            elif config['hard_sample_difficulty_weight'] is not None:
+                pred_sdf = torch.clamp(pred_sdf, -1, 1)
 
             if config['verbose'] is True:
                 print('len pred_sdf', pred_sdf.shape)
@@ -288,7 +296,16 @@ def train_epoch(
                     difficulty_weight = 1 / (l1_losses[surf_idx] ** config['sample_difficulty_lx']  + config['sample_difficulty_lx_epsilon'])
                     difficulty_weight = difficulty_weight * weight_schedule
                     l1_losses[surf_idx] = l1_losses[surf_idx] * difficulty_weight
-            
+                    
+            elif config['hard_sample_difficulty_power'] is not None:
+                weight_schedule = calc_weight(epoch, config['n_epochs'], config['hard_sample_difficulty_schedule'], config['hard_sample_difficulty_cooldown'])
+
+                for surf_idx, surf_gt_ in enumerate(sdf_gt):
+                    weight = 1 + config['hard_sample_difficulty_alpha'] * (-1 * surf_gt_[split_idx].squeeze(1).cuda() * pred_sdf[:, surf_idx])
+                    weight = torch.clamp(weight, min=0)
+                    weight = weight ** (config['hard_sample_difficulty_power'] * weight_schedule)
+                    l1_losses[surf_idx] = l1_losses[surf_idx] * weight
+                    
             # Weight each surface loss by the number of samples it has
             # so that the sum of them all is the same as the mean loss. 
             for idx, l1_loss_ in enumerate(l1_losses):
@@ -315,7 +332,7 @@ def train_epoch(
             for l1_idx, l1_loss_ in enumerate(l1_losses):
                 l1_loss += l1_loss_.sum() * weights[l1_idx]
             
-            # Normalize by number of surfaces
+            # Normalize by number of surfaces 
             l1_loss = l1_loss / len(l1_losses)
 
             if config['verbose'] is True:

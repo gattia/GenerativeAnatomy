@@ -61,15 +61,19 @@ def add_plain_lr_to_config(config, idx_model=0, idx_latent=1):
         'model': idx_model,
         'latent': idx_latent,
     }
-
+    
     schedule_specs = config["LearningRateSchedule"]
 
     for key, idx in schedules.items():
         schedule_ = schedule_specs[idx]
         config[f'{key}_lr_type'] = schedule_["Type"]
         config[f'{key}_lr_initial'] = schedule_["Initial"]
-        config[f'{key}_lr_update_interval'] = schedule_["Interval"]
-        config[f'{key}_lr_update_factor'] = schedule_["Factor"]
+        if "Interval" in schedule_.keys():
+            config[f'{key}_lr_update_interval'] = schedule_["Interval"]
+        if "Factor" in schedule_.keys():
+            config[f'{key}_lr_update_factor'] = schedule_["Factor"]
+        if "Final" in schedule_.keys():
+            config[f'{key}_lr_final'] = schedule_["Final"]
     return config
 
 class NoOpProfiler:

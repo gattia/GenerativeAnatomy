@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from GenerativeAnatomy.sdf.mesh import create_mesh_diffusion_sdf
 
@@ -21,12 +22,15 @@ except:
     print('Error importing `sinkhorn` from GenerativeAnatomy.dependencies')
     __emd__ = False
 
+from .recon_evaluation import compute_recon_loss
 
 def reconstruct_mesh_diffusion_sdf(
     model,
     path,
     latent_size=256,
     calc_symmetric_chamfer=False,
+    n_samples_chamfer=None,
+    chamfer_norm=2,
     calc_emd=False,
     return_unscaled=True,
     n_pts_per_axis=256,
@@ -62,14 +66,14 @@ def reconstruct_mesh_diffusion_sdf(
         multi_object = False
     elif isinstance(path, (list, tuple)):
         multi_object = True
+    else:
+        raise ValueError('`path` must be a string or a list/tuple of strings')
 
-    # if not isinstance(decoders,(list, tuple)):
-    #     decoders = [decoders,]
     if register_similarity is True:
         # create mean mesh of only mesh, or "mesh_to_scale" if more than one. 
         mean_latent = torch.zeros(1, latent_size*3)
         mean_mesh = create_mesh_diffusion_sdf(
-            model, 
+            model,
             latent_vector=mean_latent.cuda(),
             n_pts_per_axis=n_pts_per_axis_mean_mesh,
             verbose=verbose,
@@ -81,18 +85,18 @@ def reconstruct_mesh_diffusion_sdf(
             result = {
                 'mesh': [None, ]
             }
+            #TODO: Update to handle nan results for multiple surfaces?
             if calc_symmetric_chamfer:
-                for idx in range(len(decoders)):
-                    result[f'chamfer_{idx}'] = np.nan
+                result['chamfer_0'] = np.nan
             if calc_emd:
-                for idx in range(len(decoders)):
-                    result['emd_{idx}'] = np.nan
+                result['emd_0'] = np.nan
             if return_latent:
                 result['latent'] = mean_latent
             return result
+        
     if multi_object is False:
         result_ = read_mesh_get_sampled_pts(
-            path, 
+            path,
             center_pts=True,
             #TODO: Add axis align back in - see code commented above for example
             # axis_align=False,
@@ -106,24 +110,23 @@ def reconstruct_mesh_diffusion_sdf(
             mean_mesh=mean_mesh if register_similarity else None,
         )
     elif multi_object is True:
-        raise NotImplementedError('Multiple Objects are note yet testes for diffusion sdf!')
         result_ = read_meshes_get_sampled_pts(
             paths=path,
-            mean=[0,0,0], 
+            mean=[0,0,0],
             center_pts=True,
-            #TODO: Add axis align back in - see code commented above for example
-            # axis_align=False,
             norm_pts=True,
             scale_all_meshes=scale_all_meshes,
             mesh_to_scale=mesh_to_scale,
             scale_method=scale_method,
             get_random=False,
-            return_orig_mesh=True if (calc_symmetric_chamfer & return_unscaled) else False, # if want to calc, then need orig mesh
-            return_new_mesh=True if (calc_symmetric_chamfer & (return_unscaled==False)) else False,
-            return_orig_pts=True if (calc_symmetric_chamfer & return_unscaled) else False,
+            return_orig_mesh=True, 
+            return_new_mesh=True,
+            return_orig_pts=True,
             register_to_mean_first=True if register_similarity else False,
             mean_mesh=mean_mesh if register_similarity else None,
         )
+    else:
+        raise ValueError('`multi_object` must be a boolean')
     
     xyz = result_['pts']
     sdf_gt = result_['sdf']
@@ -178,64 +181,21 @@ def reconstruct_mesh_diffusion_sdf(
     
     meshes = [mesh,]
 
-    if calc_symmetric_chamfer or calc_emd:
-        pts_recon = []
-        xyz_recon = []
-        xyz_orig = []
-        for mesh_idx, mesh in enumerate(meshes):
-            if mesh is not None:
-                pts_recon.append(mesh.point_coords)
-                xyz_recon.append(torch.from_numpy(pts_recon[-1]).float())
-            else:
-                pts_recon.append(None)
-                xyz_recon.append(None)
-            
-            if multi_object is True:
-                xyz_orig_ = result_['orig_pts'][mesh_idx]
-            else:
-                xyz_orig_ = result_['orig_pts']
-            if not isinstance(xyz_orig_, torch.Tensor):
-                xyz_orig_ = torch.from_numpy(xyz_orig_).float()
-            xyz_orig.append(xyz_orig_)    
-
-    if calc_symmetric_chamfer:
-        if __chamfer__ is True:
-            chamfer_loss = []
-            for pts_idx in range(len(meshes)):
-                if pts_recon[pts_idx] is None:
-                    chamfer_loss.append(np.nan)
-                else:
-                    chamfer_loss_, _ = chamfer_distance(xyz_orig[pts_idx].unsqueeze(0), xyz_recon[pts_idx].unsqueeze(0))
-                    chamfer_loss.append(chamfer_loss_.item())
-            if verbose is True:
-                print('general xyz mean, min, max', torch.mean(xyz, dim=0), torch.min(xyz, dim=0), torch.max(xyz, dim=0))
-                print('orig mean, min, max', torch.mean(xyz_orig, dim=0), torch.min(xyz_orig, dim=0), torch.max(xyz_orig, dim=0))
-                print('new mean, min, max', torch.mean(xyz_recon, dim=0), torch.min(xyz_recon, dim=0), torch.max(xyz_recon, dim=0))
-        elif __chamfer__ is False:
-            raise ImportError('Cannot calculate symmetric chamfer distance without chamfer_pytorch module')
-    
-    if calc_emd:
-        if __emd__ is True:
-            emd_loss = []
-            for pts_idx in range(len(meshes)):
-                if pts_recon[pts_idx] is None:
-                    emd_loss.append(np.nan)
-                else:
-                    emd_loss_, _, _ = sinkhorn(xyz_orig[pts_idx], xyz_recon[pts_idx])
-                    emd_loss.append(emd_loss_.item())
-        elif __emd__ is False:
-            raise ImportError('Cannot calculate EMD without emd module') 
-    
     if calc_emd or calc_symmetric_chamfer or return_latent:
-        result = {
-            'mesh': meshes,
-        }
-        if calc_symmetric_chamfer:
-            for idx, chamfer_loss in enumerate(chamfer_loss):
-                result[f'chamfer_{idx}'] = chamfer_loss
-        if calc_emd:
-            for idx, emd_loss in enumerate(emd_loss):
-                result['emd_{idx}'] = emd_loss
+        result = {'mesh': meshes,}
+
+        if calc_emd or calc_symmetric_chamfer:
+            result_ = compute_recon_loss(
+                meshes=meshes,
+                orig_pts=result_['orig_pts'],
+                n_samples_chamfer=n_samples_chamfer,
+                chamfer_norm=chamfer_norm,
+                calc_symmetric_chamfer=calc_symmetric_chamfer,
+                calc_emd=calc_emd,
+            )
+
+            result.update(result_)
+        
         if return_latent:
             result['latent'] = mean_latent_mu
         return result

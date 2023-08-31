@@ -44,7 +44,7 @@ class Bone(Dataset):
         if path_ref_mesh is not None:
             self.ref_mesh = mskt.mesh.io.read_vtk(path_ref_mesh)
             self.ref_verts, self.ref_faces = vtk_to_torch(self.ref_mesh)
-            self.ref_scale = torch.max(norm(self.ref_verts), dim=-1, keepdim=True).values.unsqueeze(-1)
+            self.ref_scale = torch.max(torch.norm(self.ref_verts, dim=-1), dim=-1, keepdim=True).values.unsqueeze(-1)
         else:
             self.ref_scale = None
         

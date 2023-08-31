@@ -45,8 +45,9 @@ def train_diffusion_sdf(
         batch_size=config['objects_per_batch'],
         shuffle=True,
         num_workers=config['num_data_loader_threads'],
-        drop_last=True if config['objects_per_batch'] < len(sdf_dataset) else False,
-        # pin_memory=True,
+        drop_last=False,
+        prefetch_factor=config['prefetch_factor'],
+        pin_memory=True,
         # persistent_workers=True,
     )
 
@@ -91,34 +92,36 @@ def train_diffusion_sdf(
 
             #TODO: Maybe add an option for when/how often validation is performed?
             if ('val_paths' in config) & (config['val_paths'] is not None):
+                torch.cuda.empty_cache()
                 dict_loss = get_mean_errors(
-                    mesh_paths=config['val_paths'],
-                    num_iterations=config['num_iterations_recon'],
-                    decoders=model,
-                    # num_iterations=100,
-                    latent_size=config['latent_size'],
-                    calc_symmetric_chamfer=config['chamfer'],
-                    calc_emd=config['emd'],
                     model_type='diffusion',
-                    point_cloud_size=config['point_cloud_size'],
+
+                    mesh_paths=config['val_paths'],
+                    decoders=model,
+                    num_iterations=config['num_iterations_recon'],
                     register_similarity=True,
-                    verbose=config['verbose'],
-                    get_rand_pts=config['get_rand_pts_recon'],
-                    n_pts_random=config['n_pts_random_recon'],
+                    latent_size=config['latent_size'],
                     lr=config['lr_recon'],
                     l2reg=config['l2reg_recon'],
                     clamp_dist=config['clamp_dist_recon'],
                     n_lr_updates=config['n_lr_updates_recon'],
                     lr_update_factor=config['lr_update_factor_recon'],
-                    convergence_patience=config['convergence_patience_recon'],
-                    batch_size_latent_recon=config['batch_size_latent_recon'],
+                    calc_symmetric_chamfer=config['chamfer'],
+                    calc_emd=config['emd'],
                     convergence=config['convergence_type_recon'],
+                    convergence_patience=config['convergence_patience_recon'],
+                    verbose=config['verbose'],
+                    # objects_per_decoder=1,
+                    batch_size_latent_recon=config['batch_size_latent_recon'],
+                    get_rand_pts=config['get_rand_pts_recon'],
+                    n_pts_random=config['n_pts_random_recon'],
                     sigma_rand_pts=config['sigma_rand_pts_recon'],
                     n_samples_latent_recon=config['n_samples_latent_recon'], 
-                )
-                for key, value in dict_loss.items():
-                    log_dict[key] = value
 
+                    point_cloud_size=config['point_cloud_size'],                    
+                )
+
+                log_dict.update(dict_loss)
         
         log_dict['epoch_time_s'] = seconds_elapsed
 

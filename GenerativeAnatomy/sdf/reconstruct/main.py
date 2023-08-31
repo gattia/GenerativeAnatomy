@@ -23,6 +23,7 @@ from .reconstruct_diffusion_sdf import reconstruct_mesh_diffusion_sdf
 import numpy as np
 import sys
 import os
+import copy
 import pymskt as mskt
 import wandb
 import time
@@ -69,6 +70,8 @@ def reconstruct_latent(
     verbose=False,
     optimizer_name='adam',
     n_samples=None,
+    max_n_samples=None,#100000,
+    n_steps_sample_ramp=None, #200,
     difficulty_weight=None,
     pts_surface=None,
 ):
@@ -101,6 +104,12 @@ def reconstruct_latent(
     # Setup n_samples, if not specified. 
     if n_samples is None:
         n_samples = xyz.shape[0]
+    
+    if (max_n_samples is not None) and (n_steps_sample_ramp is not None):
+        print('Ramping up number of samples')
+        n_samples_init = n_samples
+    else:
+        n_samples_init = None
     
     # Set a clamp (maximum) distance to "model"
     for sdf_idx, sdf in enumerate(sdf_gt):
@@ -156,36 +165,44 @@ def reconstruct_latent(
             global recon_loss_
             global latent_loss_
             global loss_
+
             recon_loss_ = 0
 
             optimizer.zero_grad()
 
-            if n_samples != xyz.shape[0]:
+            if n_samples_init is not None:
+                n_samples_ = n_samples_init + int((max_n_samples - n_samples_init) * min(1.0, (step / n_steps_sample_ramp)))
+                print(n_samples_)
+            else:
+                n_samples_ = n_samples
+                print('not changing... ', n_samples_)
+
+            if n_samples_ != xyz.shape[0]:
                 # Below if/else is just to get a list of indices to sample
                 if len(sdf_gt) > 1:
                     # get equal number of samples from each surface
                     # the list pts_surface is a list that indicates
                     # which surface each point in xyz belongs to
-                    n_samples_ = n_samples // len(sdf_gt)
+                    n_samples_per = n_samples_ // len(sdf_gt)
                     # pre allocate array to store random samples
-                    rand_samp = torch.empty(n_samples, dtype=torch.int64, device=torch.device('cuda'))
+                    rand_samp = torch.empty(n_samples_, dtype=torch.int64, device=torch.device('cuda'))
                     for idx in range(len(sdf_gt)):
                         # get the locations of the points that belong to the current surface
                         pts_ = (pts_surface == idx).nonzero(as_tuple=True)[0]
                         # get a random permutation of the points
                         perm = torch.randperm(pts_.shape[0])
                         # get the randomly permuted indices from this surface
-                        pts_ = pts_[perm[:n_samples_]]
+                        pts_ = pts_[perm[:n_samples_per]]
                         # store the points in the pre-allocated rand_samp array
-                        rand_samp[idx*n_samples_:(idx+1)*n_samples_] = pts_
+                        rand_samp[idx*n_samples_per:(idx+1)*n_samples_per] = pts_
                     
-                    if len(rand_samp) < n_samples:
+                    if len(rand_samp) < n_samples_:
                         # if we don't have enough points, then just take random points
                         perm = torch.randperm(xyz.shape[0])
-                        _idx_ = perm[:n_samples-len(rand_samp)]
+                        _idx_ = perm[:n_samples_-len(rand_samp)]
                         rand_samp = torch.cat([rand_samp, _idx_], dim=0)
                 else:
-                    rand_samp = torch.randperm(xyz.shape[0])[:n_samples]
+                    rand_samp = torch.randperm(xyz.shape[0])[:n_samples_]
 
                 # Use rand_samp indices to get xyz and sdf_gt
                 xyz_input = xyz[rand_samp, ...]
@@ -195,8 +212,15 @@ def reconstruct_latent(
                 xyz_input = xyz
                 sdf_gt_ = sdf_gt
             
+            if n_samples_init is not None:
+                # if n_samples_init is not None, then we are ramping up the number of samples
+                # so we need to update the latent_input
+                latent_input_ = latent.expand(n_samples_, -1)
+            else:
+                latent_input_ = latent_input
+                
             # concat latent and xyz that will be inputted into decoder. 
-            inputs = torch.cat([latent_input, xyz_input], dim=1)
+            inputs = torch.cat([latent_input_, xyz_input], dim=1)
 
             #TODO: potentially store each decoder's loss and return it to track in wandb?
 
@@ -345,6 +369,7 @@ def reconstruct_mesh(
     convergence='num_iterations',
     convergence_patience=50,
     fit_similarity=False,
+    scale_jointly=False,
     register_similarity=False,
     n_pts_per_axis_mean_mesh=128,
     scale_all_meshes=True, #whether when scaling a model it should be on all points in all meshes or not
@@ -359,6 +384,8 @@ def reconstruct_mesh(
     sigma_rand_pts = 0.001,
     n_samples_chamfer=None,
     n_samples_latent_recon=10000,
+    max_n_samples_latent_recon=None,#100000,
+    n_steps_sample_ramp_latent_recon=None, #200,
     difficulty_weight_recon=None,
     chamfer_norm=2,
     func=None,
@@ -403,7 +430,7 @@ def reconstruct_mesh(
     if (fit_similarity is True) and (register_similarity is True):
         raise ValueError('Cannot fit similarity and register similarity at the same time')
     
-    if register_similarity is True:
+    if (scale_jointly) or (register_similarity is True):
         # if register first, then register new mesh to the mean of the decoder (zero latent vector)
         # create mean mesh of only mesh, or "mesh_to_scale" if more than one.
         mean_latent = torch.zeros(1, latent_size)
@@ -454,15 +481,10 @@ def reconstruct_mesh(
         result_ = read_mesh_get_sampled_pts(
             path,
             sigma=sigma_rand_pts,
-            center_pts= not fit_similarity,
-            norm_pts= not fit_similarity,
+            center_pts= not scale_jointly,
+            norm_pts= not scale_jointly,
             scale_method=scale_method,
             get_random=get_rand_pts,
-            return_orig_mesh=True if (calc_symmetric_chamfer and return_unscaled) else False, # if want to calc, then need orig mesh
-            return_new_mesh=True if (calc_symmetric_chamfer and (return_unscaled==False)) else False,
-            return_orig_pts=True if (calc_symmetric_chamfer and return_unscaled) else False,
-            return_center=True, #return_unscaled,
-            return_scale=True, #return_unscaled,
             register_to_mean_first=True if register_similarity else False,
             mean_mesh=mean_mesh if register_similarity else None,
             n_pts_random=n_pts_random,
@@ -473,15 +495,12 @@ def reconstruct_mesh(
             paths=path,
             mean=[0,0,0],
             sigma=sigma_rand_pts,
-            center_pts= not fit_similarity,
-            norm_pts= not fit_similarity,
+            center_pts= not scale_jointly,
+            norm_pts= not scale_jointly,
             scale_all_meshes=scale_all_meshes,
             mesh_to_scale=mesh_to_scale,
             scale_method=scale_method,
             get_random=get_rand_pts,
-            return_orig_mesh=True if ((func is not None) or (calc_symmetric_chamfer & return_unscaled)) else False, # if want to calc, then need orig mesh
-            return_new_mesh=True if (calc_symmetric_chamfer & (return_unscaled==False)) else False,
-            return_orig_pts=True if (calc_symmetric_chamfer & return_unscaled) else False,
             register_to_mean_first=True if register_similarity else False,
             mean_mesh=mean_mesh,
             n_pts_random=n_pts_random,
@@ -552,6 +571,8 @@ def reconstruct_mesh(
             'n_samples': n_samples_latent_recon,
             'difficulty_weight': difficulty_weight_recon,
             'pts_surface': pts_surface,
+            'max_n_samples': max_n_samples_latent_recon, 
+            'n_steps_sample_ramp': n_steps_sample_ramp_latent_recon
         }
  
     elif fit_similarity is True:
@@ -639,7 +660,7 @@ def reconstruct_mesh(
     if calc_emd or calc_symmetric_chamfer or calc_assd or return_latent or (func is not None):
         result = {'mesh': meshes}
 
-        if calc_emd or calc_symmetric_chamfer:
+        if calc_emd or calc_symmetric_chamfer or calc_assd:
             result_ = compute_recon_loss(
                 meshes=meshes,
                 orig_pts=result_['orig_pts'],
@@ -663,9 +684,9 @@ def reconstruct_mesh(
             result.update(func_results)      
 
         if log_wandb is True:
-            wandb.log(result)
-        
-        
+            result_ = copy.copy(result)
+            del result_['mesh']
+            wandb.log(result_)
 
         return result
     else:
@@ -690,6 +711,7 @@ def tune_reconstruction(
         #     name=config['run_name'],
         #     tags=config['tags']
         # )
+
     
     dict_loss = get_mean_errors(
         mesh_paths=config['mesh_paths'],
@@ -708,6 +730,7 @@ def tune_reconstruction(
         n_lr_updates=config['n_lr_updates'],
         lr_update_factor=config['lr_update_factor'],
         calc_symmetric_chamfer=config['chamfer'],
+        calc_assd=config['assd'],
         calc_emd=config['emd'],
         convergence=config['convergence'],
         convergence_patience=config['convergence_patience'],
@@ -761,10 +784,14 @@ def get_mean_errors(
     n_pts_random=100000,
     sigma_rand_pts=0.01,
     n_samples_latent_recon=10000,
+    max_n_samples_latent_recon=None,#100000,
+    n_steps_sample_ramp_latent_recon=None, #200,
     difficulty_weight_recon=None,
     chamfer_norm=2,
     recon_func=None,
     predict_val_variables=None,
+
+    scale_jointly=False,
 ):
     """
     Reconstruct meshes & compute errors    
@@ -778,6 +805,7 @@ def get_mean_errors(
         'calc_assd':calc_assd,
         'calc_emd':calc_emd,
         'register_similarity':register_similarity,
+        'scale_jointly':scale_jointly,
         'scale_all_meshes':scale_all_meshes,
         'return_latent': True
     }
@@ -809,9 +837,12 @@ def get_mean_errors(
             'n_pts_random': n_pts_random,
             'sigma_rand_pts': sigma_rand_pts,
             'n_samples_latent_recon': n_samples_latent_recon,
+            'max_n_samples_latent_recon': max_n_samples_latent_recon,
+            'n_steps_sample_ramp_latent_recon': n_steps_sample_ramp_latent_recon,
             'difficulty_weight_recon': difficulty_weight_recon,
             'chamfer_norm': chamfer_norm,
             'func': recon_func,
+            
         }
 
         recon_fx = reconstruct_mesh
@@ -868,6 +899,10 @@ def get_mean_errors(
                 if idx == 0:
                     loss[f'emd_{mesh_idx}'] = []
                 loss[f'emd_{mesh_idx}'].append(result_[f'emd_{mesh_idx}'])
+            if calc_assd:
+                if idx == 0:
+                    loss[f'assd_{mesh_idx}'] = []
+                loss[f'assd_{mesh_idx}'].append(result_[f'assd_{mesh_idx}'])
         
         # if a function was given - append its results. 
         if (recon_func is not None):
